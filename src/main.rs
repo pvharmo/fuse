@@ -19,13 +19,10 @@ fn main() {
         .block_on(async {
             let providers: ProvidersMap = ProvidersMap::new(options).await;
         
-            // Instantiate the filesystem
             fs = Some(fuse::FuseFS::new(providers).await);
         });
 
-    // Instantiate the mountpoint
-    let mountpoint = mount::Mount::new("./mnt");
+    let mountpoint = mount::Mount::new("../tmp/orbital/mnt");
 
-    // Mount the filesystem
     mountpoint.mount(fs.unwrap()).unwrap();
 }

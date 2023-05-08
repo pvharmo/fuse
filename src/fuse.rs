@@ -89,7 +89,7 @@ impl FuseFS {
         if let Some(user_dirs) = UserDirs::new() {
             let home_path = (user_dirs.home_dir().to_string_lossy() + "/").to_string();
             let provider = ProviderId {
-                id: "My local files".to_string(),
+                id: "Local files".to_string(),
                 provider_type: nucleus_rs::storage::ProviderType::NativeFs,
             };
     
@@ -102,10 +102,15 @@ impl FuseFS {
     }
 
     fn get_children(&mut self, fs_node: Arc<FsNode>) -> Vec<Arc<FsNode>> {
+        let path = fs_node.id.clone();
+
+        if !path.is_directory() || path.as_str().contains("orbital/mnt"){
+            return Vec::new();
+        }
+
         let fs_provider = self.providers.get_provider((*fs_node.provider_id).clone()).unwrap();
         let state = fs_node.content_state.lock().unwrap().to_owned().clone();
         
-        let path = fs_node.id.clone();
         
         let children;
         match state {
@@ -117,6 +122,7 @@ impl FuseFS {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 println!("start loading");
                 let res = rt.block_on(async {
+                    println!("path: {path}");
                     fs_provider.as_filesystem().unwrap().list_folder_content(path).await
                 }).unwrap();
 
@@ -162,9 +168,15 @@ impl Filesystem for FuseFS {
 
         let fs_node = self.blut.find_with_name(parent_inode, name.to_str().unwrap());
 
-        dbg!(&fs_node);
-
+        
         if let Some(fs_node) = fs_node {
+            println!("got ino: {}", fs_node.inode);
+            let file_type: FileType = if fs_node.id.is_directory() {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            };
+
             reply.entry(&TTL, &FileAttr {
                 ino: fs_node.inode,
                 size: 0,
@@ -173,9 +185,9 @@ impl Filesystem for FuseFS {
                 mtime: UNIX_EPOCH,
                 ctime: UNIX_EPOCH,
                 crtime: UNIX_EPOCH,
-                kind: FileType::Directory,
+                kind: file_type,
                 perm: 0o755,
-                nlink: 0,
+                nlink: self.get_children(fs_node.clone()).len() as u32,
                 uid: 501,
                 gid: 20,
                 rdev: 0,
@@ -193,7 +205,13 @@ impl Filesystem for FuseFS {
             return;
         }
 
-        if let Some(_fs_node) = self.blut.find_with_inode(ino) {
+        if let Some(fs_node) = self.blut.find_with_inode(ino) {
+            let file_type = if fs_node.id.is_directory() {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            };
+
             reply.attr(&TTL, &FileAttr {
                 ino,
                 size: 0,
@@ -202,9 +220,9 @@ impl Filesystem for FuseFS {
                 mtime: UNIX_EPOCH,
                 ctime: UNIX_EPOCH,
                 crtime: UNIX_EPOCH,
-                kind: FileType::Directory,
+                kind: file_type,
                 perm: 0o755,
-                nlink: 4,
+                nlink: self.get_children(fs_node.clone()).len() as u32,
                 uid: 501,
                 gid: 20,
                 rdev: 0,
@@ -235,18 +253,24 @@ impl Filesystem for FuseFS {
         }
 
         match offset {
-            0 => {let _ = reply.add(1, 1, FileType::Directory, OsStr::from_bytes(b"."));},
-            1 => {let _ = reply.add(1, 2, FileType::Directory, OsStr::from_bytes(b".."));},
+            // 0 => {let _ = reply.add(1, 1, FileType::Directory, OsStr::from_bytes(b"."));},
+            // 1 => {let _ = reply.add(1, 2, FileType::Directory, OsStr::from_bytes(b".."));},
             _ => {
                 println!("offset: {}", offset);
 
                 if let Some(fs_node) = self.blut.find_with_inode(dir_inode) {
                     let children = self.get_children(fs_node);
-                    if offset - 2 < children.len().try_into().unwrap() {
-                        let child = children.get((offset - 2) as usize).unwrap().as_ref();
+                    if offset < children.len().try_into().unwrap() {
+                        let child = children.get((offset) as usize).unwrap().as_ref();
                         let file_name = child.name.clone();
                         let file_name = file_name.as_bytes();
-                        let _ = reply.add(child.inode, offset + 1, FileType::RegularFile, OsStr::from_bytes(file_name));
+                        println!("child: {}", child.inode);
+                        let file_type = if child.id.is_directory() {
+                            FileType::Directory
+                        } else {
+                            FileType::RegularFile
+                        };
+                        let _ = reply.add(child.inode, offset + 1, file_type, OsStr::from_bytes(file_name));
                     }
                 }
             }
