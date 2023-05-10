@@ -31,7 +31,7 @@ pub struct FsNode {
     pub flags: u32,
     pub provider_id: Arc<ProviderId>,
     #[derivative(PartialEq="ignore")]
-    pub content_state: Arc<Mutex<FileState>>,
+    pub content_state: FileState,
     #[derivative(PartialEq="ignore")]
     pub children: Vec<Arc<Mutex<FsNode>>>,
 }
@@ -53,22 +53,41 @@ impl FsTree {
             next_inode: 2,
         };
 
+        let mut root = FsNode {
+            id: ObjectId::root(),
+            name: "/".to_string(),
+            provider_id: Arc::new(ProviderId {id: "".to_string(), provider_type: crossroads::storage::ProviderType::NativeFs}),
+            inode: 1,
+            size: 0,
+            blocks: 0,
+            atime: SystemTime::UNIX_EPOCH,
+            mtime: SystemTime::UNIX_EPOCH,
+            ctime: SystemTime::UNIX_EPOCH,
+            crtime: SystemTime::UNIX_EPOCH,
+            perm: 0o777,
+            uid: 501,
+            gid: 20,
+            rdev: 0,
+            blksize: 0,
+            flags: 0,
+            content_state: FileState::ShallowReady,
+            children: Vec::new()
+        };
+
         for provider_id in providers {
             blut.new_file(
-                1,
+                &mut root,
                 ObjectId::root(),
                 provider_id.id.clone().as_str(),
-                FileState::ShallowReady,
                 0,
                 Arc::new(provider_id),
-                Vec::new()
             );
         }
 
         blut
     }
 
-    pub fn new_file(&mut self, parent_inode: u64, id: ObjectId, name: &str, content_state: FileState, size: u64, provider_id: Arc<ProviderId>, children: Vec<Arc<Mutex<FsNode>>>) -> Arc<Mutex<FsNode>> {
+    pub fn new_file(&mut self, parent: &mut FsNode, id: ObjectId, name: &str, size: u64, provider_id: Arc<ProviderId>) -> Arc<Mutex<FsNode>> {
         let inode = self.next_inode;
         self.next_inode += 1;
 
@@ -89,13 +108,15 @@ impl FsTree {
             rdev: 0,
             blksize: 0,
             flags: 0,
-            content_state: Arc::new(Mutex::new(content_state)),
-            children: children
+            content_state: FileState::ShallowReady,
+            children: Vec::new()
         }));
+
+        parent.children.push(file.clone());
 
         self.inodes.insert(inode, file.clone());
         self.ids.insert((id, (*provider_id).clone()), file.clone());
-        self.names.insert((parent_inode, name.to_string()), file.clone());
+        self.names.insert((parent.inode, name.to_string()), file.clone());
 
         file
     }

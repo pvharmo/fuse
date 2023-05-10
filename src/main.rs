@@ -22,7 +22,7 @@ fn main() {
             fs = Some(fuse::FuseFS::new(providers).await);
         });
 
-    let mountpoint = mount::Mount::new("./fuse/mnt");
+    let mountpoint = mount::Mount::new("../tmp/fuse/mnt");
 
     mountpoint.mount(fs.unwrap()).unwrap();
 }

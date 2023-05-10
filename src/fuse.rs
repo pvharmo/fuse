@@ -10,7 +10,7 @@ use crossroads::providers::onedrive::token::OneDriveToken;
 use std::fs;
 
 use fuser::{FileType, FileAttr, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
-use crossroads::interfaces::filesystem::{ObjectId, FileSystem};
+use crossroads::interfaces::filesystem::{ObjectId, FileSystem, File};
 use crossroads::providers::native_fs::NativeFs;
 use crossroads::storage::{ProvidersMap, ProviderId};
 use serde_json::Value;
@@ -106,40 +106,36 @@ impl FuseFS {
         }
 
         let fs_provider = self.providers.get_provider((*node.provider_id).clone()).unwrap();
-        let state = node.content_state.lock().unwrap().to_owned().clone();
         
-        match state {
+        match node.content_state.clone() {
             FileState::ShallowReady => {
-                let mut state = node.content_state.lock().unwrap();
-                *state = FileState::Loading;
-                drop(state);
+                node.content_state = FileState::Loading;
+
+                dbg!(&path);
 
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 let res = rt.block_on(async {
                     fs_provider.as_filesystem().unwrap().list_folder_content(path).await
                 }).unwrap();
 
+                let provider_id = node.provider_id.clone();
+
                 for file in res {
-                    let new_file = self.blut.new_file(
-                        node.inode,
+                    self.blut.new_file(
+                        node,
                         file.id.clone(),
                         file.name.as_str(),
-                        FileState::ShallowReady,
                         file.size.unwrap_or(0),
-                        node.provider_id.clone(),
-                        Vec::new(),
+                        provider_id.clone(),
                     );
-                    node.children.push(new_file);
                 }
 
-
-                let mut state = node.content_state.lock().unwrap();
-                *state = FileState::DeepReady;
+                node.content_state = FileState::DeepReady;
 
                 children = node.children.clone();
             },
             FileState::Loading => {
-                while node.content_state.lock().unwrap().to_owned() == FileState::Loading {
+                while node.content_state == FileState::Loading {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 children = node.children.clone();
@@ -183,6 +179,8 @@ impl Filesystem for FuseFS {
                     blksize: 512,
                 }, 0);
             }
+        } else {
+            reply.error(ENOENT);
         }
     }
 
@@ -313,6 +311,117 @@ impl Filesystem for FuseFS {
 
         reply.ok();
     }
+
+    fn mkdir(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+
+        if let Some(parent_dir) = self.blut.find_with_inode(parent) {
+            if let Ok(mut parent_dir) = parent_dir.lock() {
+                let provider = self.providers.get_provider(parent_dir.provider_id.as_ref().clone()).unwrap();
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    
+                rt.block_on(async {
+                    let id = ObjectId::directory(parent_dir.id.to_string() + "/" + name.to_str().unwrap());
+                    provider.as_filesystem().unwrap().create(parent_dir.id.clone(), File {
+                        id: id.clone(),
+                        name: name.to_str().unwrap().to_string(),
+                        mime_type: Some("directory".to_string()),
+                        created_at: None,
+                        modified_at: None,
+                        size: None,
+                    }).await.unwrap();
+
+                    let provider_id = parent_dir.provider_id.clone();
+
+                    let new_file = self.blut.new_file(&mut parent_dir, id, name.to_str().unwrap(), 0, provider_id);
+
+                    dbg!(_mode);
+                    dbg!(_umask);
+
+                    reply.entry(&TTL, &FileAttr {
+                        ino: new_file.lock().unwrap().inode,
+                        size: 0,
+                        blocks: 0,
+                        atime: SystemTime::now(), // 1970-01-01 00:00:00
+                        mtime: SystemTime::now(),
+                        ctime: SystemTime::now(),
+                        crtime: SystemTime::now(),
+                        kind: FileType::Directory,
+                        perm: 0o755,
+                        nlink: 0,
+                        uid: 501,
+                        gid: 20,
+                        rdev: 0,
+                        flags: 0,
+                        blksize: 512,                    
+                    }, 0);
+                });
+            }
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    fn mknod(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        if let Some(parent_dir) = self.blut.find_with_inode(parent) {
+            if let Ok(mut parent_dir) = parent_dir.lock() {
+                let provider = self.providers.get_provider(parent_dir.provider_id.as_ref().clone()).unwrap();
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    
+                rt.block_on(async {
+                    let id = ObjectId::new(parent_dir.id.to_string() + "/" + name.to_str().unwrap(), None);
+                    provider.as_filesystem().unwrap().create(parent_dir.id.clone(), File {
+                        id: id.clone(),
+                        name: name.to_str().unwrap().to_string(),
+                        mime_type: None,
+                        created_at: None,
+                        modified_at: None,
+                        size: None,
+                    }).await.unwrap();
+
+                    let provider_id = parent_dir.provider_id.clone();
+
+                    let new_file = self.blut.new_file(&mut parent_dir, id, name.to_str().unwrap(), 0, provider_id);
+
+                    reply.entry(&TTL, &FileAttr {
+                        ino: new_file.lock().unwrap().inode,
+                        size: 0,
+                        blocks: 0,
+                        atime: SystemTime::now(), // 1970-01-01 00:00:00
+                        mtime: SystemTime::now(),
+                        ctime: SystemTime::now(),
+                        crtime: SystemTime::now(),
+                        kind: FileType::RegularFile,
+                        perm: 0o755,
+                        nlink: 0,
+                        uid: 501,
+                        gid: 20,
+                        rdev: 0,
+                        flags: 0,
+                        blksize: 512,                    
+                    }, 0);
+                });
+            }
+        } else {
+            reply.error(ENOENT);
+        }
+    }
     
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
         println!("read: {}", ino);
@@ -332,7 +441,7 @@ impl Filesystem for FuseFS {
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+    fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
         reply.opened(0, 0)
     }
 
