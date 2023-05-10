@@ -1,20 +1,20 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{ffi::OsStr};
 use std::os::unix::ffi::OsStrExt;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH, SystemTime};
 use directories::{ProjectDirs, UserDirs};
 use libc::ENOENT;
-use nucleus_rs::providers::google_drive::Token;
-use nucleus_rs::providers::onedrive::token::OneDriveToken;
+use crossroads::providers::google_drive::Token;
+use crossroads::providers::onedrive::token::OneDriveToken;
 use std::fs;
 
 use fuser::{FileType, FileAttr, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
-use nucleus_rs::interfaces::filesystem::{ObjectId, FileSystem};
-use nucleus_rs::providers::native_fs::NativeFs;
-use nucleus_rs::storage::{ProvidersMap, ProviderId};
+use crossroads::interfaces::filesystem::{ObjectId, FileSystem};
+use crossroads::providers::native_fs::NativeFs;
+use crossroads::storage::{ProvidersMap, ProviderId};
 use serde_json::Value;
-use nucleus_rs::storage::ProviderType;
+use crossroads::storage::ProviderType;
 
 use crate::blut::{FsTree, FsNode, FileState};
 
@@ -43,8 +43,6 @@ const ROOT_DIR_ATTR: FileAttr = FileAttr {
     blksize: 512,
 };
 
-const HELLO_TXT_CONTENT: &str = "Hello World!\n";
-
 impl FuseFS {
     pub async fn new(mut providers: ProvidersMap) -> Self {
         let storage = NativeFs { root : "".to_string() };
@@ -56,8 +54,6 @@ impl FuseFS {
                 fs::create_dir_all(data_dir.clone()).expect(format!("Unable to create directory {}", data_dir).as_str());
             }
             let files = storage.list_folder_content(ObjectId::directory(data_dir.clone())).await.unwrap();
-            println!("{}", &files.len());
-
     
             for file in files {
                 let path = x.clone() + "/" + file.name.as_str();
@@ -90,7 +86,7 @@ impl FuseFS {
             let home_path = (user_dirs.home_dir().to_string_lossy() + "/").to_string();
             let provider = ProviderId {
                 id: "Local files".to_string(),
-                provider_type: nucleus_rs::storage::ProviderType::NativeFs,
+                provider_type: crossroads::storage::ProviderType::NativeFs,
             };
     
             providers.add_provider(provider, serde_json::to_value(home_path.clone()).unwrap()).await.unwrap();
@@ -101,60 +97,55 @@ impl FuseFS {
         FuseFS { providers, blut: FsTree::new(providers_list) }
     }
 
-    fn get_children(&mut self, fs_node: Arc<FsNode>) -> Vec<Arc<FsNode>> {
-        let path = fs_node.id.clone();
+    fn get_children(&mut self, node: &mut FsNode) -> Vec<Arc<Mutex<FsNode>>> {
+        let children;
+        let path = node.id.clone();
 
-        if !path.is_directory() || path.as_str().contains("orbital/mnt"){
+        if !path.is_directory() || path.as_str().contains("fuse/mnt"){
             return Vec::new();
         }
 
-        let fs_provider = self.providers.get_provider((*fs_node.provider_id).clone()).unwrap();
-        let state = fs_node.content_state.lock().unwrap().to_owned().clone();
+        let fs_provider = self.providers.get_provider((*node.provider_id).clone()).unwrap();
+        let state = node.content_state.lock().unwrap().to_owned().clone();
         
-        
-        let children;
         match state {
             FileState::ShallowReady => {
-                let mut state = fs_node.content_state.lock().unwrap();
+                let mut state = node.content_state.lock().unwrap();
                 *state = FileState::Loading;
                 drop(state);
 
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-                println!("start loading");
                 let res = rt.block_on(async {
-                    println!("path: {path}");
                     fs_provider.as_filesystem().unwrap().list_folder_content(path).await
                 }).unwrap();
 
                 for file in res {
                     let new_file = self.blut.new_file(
+                        node.inode,
                         file.id.clone(),
                         file.name.as_str(),
                         FileState::ShallowReady,
-                        fs_node.provider_id.clone(),
-                        Arc::downgrade(&fs_node),
+                        file.size.unwrap_or(0),
+                        node.provider_id.clone(),
                         Vec::new(),
                     );
-                    fs_node.children.lock().unwrap().push(new_file);
+                    node.children.push(new_file);
                 }
 
 
-                let mut state = fs_node.content_state.lock().unwrap();
+                let mut state = node.content_state.lock().unwrap();
                 *state = FileState::DeepReady;
 
-                children = fs_node.children.lock().unwrap().clone();
+                children = node.children.clone();
             },
             FileState::Loading => {
-                println!("Loading");
-                while fs_node.content_state.lock().unwrap().to_owned() == FileState::Loading {
-                    println!("sleeping");
+                while node.content_state.lock().unwrap().to_owned() == FileState::Loading {
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                children = fs_node.children.lock().unwrap().clone();
+                children = node.children.clone();
             },
             FileState::DeepReady => {
-                println!("DeepReady");
-                children = fs_node.children.lock().unwrap().clone();
+                children = node.children.clone();
             },
         }
 
@@ -165,35 +156,76 @@ impl FuseFS {
 impl Filesystem for FuseFS {
     fn lookup(&mut self, _req: &Request, parent_inode: u64, name: &OsStr, reply: ReplyEntry) {
         println!("lookup: {parent_inode}, {}", name.to_str().unwrap());
-
-        let fs_node = self.blut.find_with_name(parent_inode, name.to_str().unwrap());
-
         
-        if let Some(fs_node) = fs_node {
-            println!("got ino: {}", fs_node.inode);
-            let file_type: FileType = if fs_node.id.is_directory() {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
-            };
+        if let Some(fs_node) = self.blut.find_with_name(parent_inode, name.to_str().unwrap()) {
+            if let Ok(mut node) = fs_node.lock() {
+                let file_type: FileType = if node.id.is_directory() {
+                    FileType::Directory
+                } else {
+                    FileType::RegularFile
+                };
+    
+                reply.entry(&TTL, &FileAttr {
+                    ino: node.inode,
+                    size: node.size,
+                    blocks: 0,
+                    atime: UNIX_EPOCH, // 1970-01-01 00:00:00
+                    mtime: UNIX_EPOCH,
+                    ctime: UNIX_EPOCH,
+                    crtime: UNIX_EPOCH,
+                    kind: file_type,
+                    perm: 0o755,
+                    nlink: self.get_children(&mut node).len() as u32,
+                    uid: 501,
+                    gid: 20,
+                    rdev: 0,
+                    flags: 0,
+                    blksize: 512,
+                }, 0);
+            }
+        }
+    }
 
-            reply.entry(&TTL, &FileAttr {
-                ino: fs_node.inode,
-                size: 0,
-                blocks: 0,
-                atime: UNIX_EPOCH, // 1970-01-01 00:00:00
-                mtime: UNIX_EPOCH,
-                ctime: UNIX_EPOCH,
-                crtime: UNIX_EPOCH,
-                kind: file_type,
-                perm: 0o755,
-                nlink: self.get_children(fs_node.clone()).len() as u32,
-                uid: 501,
-                gid: 20,
-                rdev: 0,
-                flags: 0,
-                blksize: 512,
-            }, 0);
+    fn setattr(
+            &mut self,
+            _req: &Request<'_>,
+            ino: u64,
+            _mode: Option<u32>,
+            uid: Option<u32>,
+            gid: Option<u32>,
+            size: Option<u64>,
+            _atime: Option<fuser::TimeOrNow>,
+            _mtime: Option<fuser::TimeOrNow>,
+            _ctime: Option<std::time::SystemTime>,
+            _fh: Option<u64>,
+            _crtime: Option<std::time::SystemTime>,
+            _chgtime: Option<std::time::SystemTime>,
+            _bkuptime: Option<std::time::SystemTime>,
+            flags: Option<u32>,
+            reply: ReplyAttr,
+        ) {
+        if let Some(fs_node) = self.blut.find_with_inode(ino) {
+            if let Ok(node) = fs_node.lock() {
+                reply.attr(&TTL, &FileAttr {
+                    ino: node.inode,
+                    size: size.unwrap_or(node.size),
+                    blocks: node.blocks,
+                    atime: SystemTime::now(),
+                    mtime: SystemTime::now(),
+                    ctime: SystemTime::now(),
+                    crtime: SystemTime::now(),
+                    kind: if node.id.is_directory() {FileType::Directory} else {FileType::RegularFile},
+                    perm: node.perm,
+                    nlink: node.children.len() as u32,
+                    uid: uid.unwrap_or(node.uid),
+                    gid: gid.unwrap_or(node.gid),
+                    rdev: node.rdev,
+                    blksize: node.blksize,
+                    flags: flags.unwrap_or(node.flags), 
+                })
+            }
+        } else {
+            reply.error(ENOENT);
         }
     }
 
@@ -206,29 +238,31 @@ impl Filesystem for FuseFS {
         }
 
         if let Some(fs_node) = self.blut.find_with_inode(ino) {
-            let file_type = if fs_node.id.is_directory() {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
-            };
-
-            reply.attr(&TTL, &FileAttr {
-                ino,
-                size: 0,
-                blocks: 0,
-                atime: UNIX_EPOCH, // 1970-01-01 00:00:00
-                mtime: UNIX_EPOCH,
-                ctime: UNIX_EPOCH,
-                crtime: UNIX_EPOCH,
-                kind: file_type,
-                perm: 0o755,
-                nlink: self.get_children(fs_node.clone()).len() as u32,
-                uid: 501,
-                gid: 20,
-                rdev: 0,
-                flags: 0,
-                blksize: 512,                    
-            });
+            if let Ok(mut node) = fs_node.lock() {
+                let file_type = if node.id.is_directory() {
+                    FileType::Directory
+                } else {
+                    FileType::RegularFile
+                };
+    
+                reply.attr(&TTL, &FileAttr {
+                    ino,
+                    size: node.size,
+                    blocks: 0,
+                    atime: UNIX_EPOCH, // 1970-01-01 00:00:00
+                    mtime: UNIX_EPOCH,
+                    ctime: UNIX_EPOCH,
+                    crtime: UNIX_EPOCH,
+                    kind: file_type,
+                    perm: 0o755,
+                    nlink: self.get_children(&mut node).len() as u32,
+                    uid: 501,
+                    gid: 20,
+                    rdev: 0,
+                    flags: 0,
+                    blksize: 512,                    
+                });
+            }
         } else {
             reply.error(ENOENT);
         }
@@ -239,38 +273,39 @@ impl Filesystem for FuseFS {
 
         if dir_inode == 1 {
             let providers = self.providers.list_providers();
-            println!("len: {}, offset: {offset}", providers.len());
             if offset < providers.len().try_into().unwrap() {
-                println!("test");
                 let provider = providers.get(offset as usize).unwrap();
                 let provider_name = provider.id.clone();
                 let provider_name = provider_name.as_bytes();
                 let node = self.blut.find_with_ids(ObjectId::root(), (*provider).clone());
-                let _ = reply.add(node.unwrap().inode, offset + 1, FileType::Directory, OsStr::from_bytes(provider_name));
+                if let Ok(node) = node.unwrap().lock() {
+                    let _ = reply.add(node.inode, offset + 1, FileType::Directory, OsStr::from_bytes(provider_name));
+                }
             }
             reply.ok();
             return;
         }
 
         match offset {
-            // 0 => {let _ = reply.add(1, 1, FileType::Directory, OsStr::from_bytes(b"."));},
-            // 1 => {let _ = reply.add(1, 2, FileType::Directory, OsStr::from_bytes(b".."));},
+            0 => {let _ = reply.add(1, 1, FileType::Directory, OsStr::from_bytes(b"."));},
+            1 => {let _ = reply.add(1, 2, FileType::Directory, OsStr::from_bytes(b".."));},
             _ => {
                 println!("offset: {}", offset);
 
                 if let Some(fs_node) = self.blut.find_with_inode(dir_inode) {
-                    let children = self.get_children(fs_node);
-                    if offset < children.len().try_into().unwrap() {
-                        let child = children.get((offset) as usize).unwrap().as_ref();
-                        let file_name = child.name.clone();
-                        let file_name = file_name.as_bytes();
-                        println!("child: {}", child.inode);
-                        let file_type = if child.id.is_directory() {
-                            FileType::Directory
-                        } else {
-                            FileType::RegularFile
-                        };
-                        let _ = reply.add(child.inode, offset + 1, file_type, OsStr::from_bytes(file_name));
+                    let children = self.get_children(&mut fs_node.lock().unwrap());
+                    if offset - 2 < children.len().try_into().unwrap() {
+                        let child = children.get((offset) as usize - 2).unwrap().as_ref();
+                        if let Ok(child) = child.lock() {
+                            let file_name = child.name.clone();
+                            let file_name = file_name.as_bytes();
+                            let file_type = if child.id.is_directory() {
+                                FileType::Directory
+                            } else {
+                                FileType::RegularFile
+                            };
+                            let _ = reply.add(child.inode, offset + 1, file_type, OsStr::from_bytes(file_name));
+                        }
                     }
                 }
             }
@@ -279,11 +314,57 @@ impl Filesystem for FuseFS {
         reply.ok();
     }
     
+    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
+        println!("read: {}", ino);
+        if let Some(file) = self.blut.find_with_inode(ino) {
+            if let Ok(file) = file.lock() {
+                let provider = self.providers.get_provider(file.provider_id.as_ref().clone()).unwrap();
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     
+                rt.block_on(async {
+                    let data = provider.as_filesystem().unwrap().read_file(file.id.clone()).await.unwrap();
+                    println!("--- read {} offset: {offset}, size: {size} ---", file.id.as_str());
+                    reply.data(&data[offset as usize..std::cmp::min(offset as usize + size as usize, data.len())]);
+                });
+            }
+        } else {
+            reply.error(ENOENT);
+        }
+    }
 
-    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, _size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
-        if ino == 2 || ino == 3 {
-            reply.data(&HELLO_TXT_CONTENT.as_bytes()[offset as usize..]);
+    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+        reply.opened(0, 0)
+    }
+
+    fn write(
+            &mut self,
+            _req: &Request<'_>,
+            ino: u64,
+            _fh: u64,
+            offset: i64,
+            data: &[u8],
+            _write_flags: u32,
+            _flags: i32,
+            _lock_owner: Option<u64>,
+            reply: fuser::ReplyWrite,
+        ) {
+        if let Some(file) = self.blut.find_with_inode(ino) {
+            if let Ok(file) = file.lock() {
+                let provider = self.providers.get_provider(file.provider_id.as_ref().clone()).unwrap();
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    
+                rt.block_on(async {
+                    let file_content = provider.as_filesystem().unwrap().read_file(file.id.clone()).await.unwrap();
+                    let content;
+                    if offset > 0 {
+                        content = [&file_content[0..offset as usize], data].concat();
+                    } else {
+                        content = data.to_vec();
+                    }
+                    provider.as_filesystem().unwrap().write_file(file.id.clone(), content.into()).await.unwrap();
+                    reply.written(data.len() as u32);
+                });
+            }
         } else {
             reply.error(ENOENT);
         }

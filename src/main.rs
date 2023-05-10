@@ -1,4 +1,4 @@
-use nucleus_rs::storage::*;
+use crossroads::storage::*;
 
 mod fuse;
 mod mount;
@@ -22,7 +22,7 @@ fn main() {
             fs = Some(fuse::FuseFS::new(providers).await);
         });
 
-    let mountpoint = mount::Mount::new("../tmp/orbital/mnt");
+    let mountpoint = mount::Mount::new("./fuse/mnt");
 
     mountpoint.mount(fs.unwrap()).unwrap();
 }

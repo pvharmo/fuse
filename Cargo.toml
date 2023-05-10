@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-nucleus-rs = { git = "https://github.com/orbi-apps/nucleus-rs" }
+crossroads = { git = "https://github.com/pvharmo/crossroads" }
 fuser = "0.12.0"
 tempfile = "3"
 libc = "0.2.51"

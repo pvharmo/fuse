@@ -227,6 +227,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossroads"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "directories",
+ "downcast-trait",
+ "eyre",
+ "google-drive3",
+ "oauth2",
+ "onedrive-api",
+ "open",
+ "regex",
+ "reqwest",
+ "rust-s3",
+ "serde",
+ "serde_json",
+ "tokio",
+ "trash",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -478,11 +501,11 @@ name = "fuse"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "crossroads",
  "derivative",
  "directories",
  "fuser",
  "libc",
- "nucleus-rs",
  "serde",
  "serde_json",
  "tempfile",
@@ -1043,29 +1066,6 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "tempfile",
-]
-
-[[package]]
-name = "nucleus-rs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "directories",
- "downcast-trait",
- "eyre",
- "google-drive3",
- "oauth2",
- "onedrive-api",
- "open",
- "regex",
- "reqwest",
- "rust-s3",
- "serde",
- "serde_json",
- "tokio",
- "trash",
 ]
 
 [[package]]
