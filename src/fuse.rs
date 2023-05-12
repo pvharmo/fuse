@@ -312,6 +312,56 @@ impl Filesystem for FuseFS {
         reply.ok();
     }
 
+    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
+        println!("unlink: {}", name.to_str().unwrap());
+
+        if let Some(node) = self.blut.find_with_name(parent, name.to_str().unwrap()) {
+            if let Ok(node) = node.lock() {
+                let provider = self.providers.get_provider(node.provider_id.as_ref().clone()).unwrap();
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    
+                rt.block_on(async {
+                    provider.as_filesystem().unwrap().delete(node.id.clone()).await.unwrap();
+                });
+            }
+
+            if let Some(parent_node) = self.blut.find_with_inode(parent) {
+                if let Ok(mut parent_node) = parent_node.lock() {
+                    parent_node.children.retain(|child| child.lock().unwrap().name != name.to_str().unwrap());
+                }
+            }
+
+            self.blut.remove(parent, node);
+        }
+
+        reply.ok();
+    }
+
+    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
+        println!("rmdir: {}", name.to_str().unwrap());
+
+        if let Some(node) = self.blut.find_with_name(parent, name.to_str().unwrap()) {
+            if let Ok(node) = node.lock() {
+                let provider = self.providers.get_provider(node.provider_id.as_ref().clone()).unwrap();
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    
+                rt.block_on(async {
+                    provider.as_filesystem().unwrap().delete(node.id.clone()).await.unwrap();
+                });
+            }
+
+            if let Some(parent_node) = self.blut.find_with_inode(parent) {
+                if let Ok(mut parent_node) = parent_node.lock() {
+                    parent_node.children.retain(|child| child.lock().unwrap().name != name.to_str().unwrap());
+                }
+            }
+
+            self.blut.remove(parent, node);
+        }
+
+        reply.ok();
+    }
+
     fn mkdir(
         &mut self,
         _req: &Request<'_>,
@@ -321,6 +371,7 @@ impl Filesystem for FuseFS {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        println!("mkdir: {}", name.to_str().unwrap());
 
         if let Some(parent_dir) = self.blut.find_with_inode(parent) {
             if let Ok(mut parent_dir) = parent_dir.lock() {
@@ -379,6 +430,8 @@ impl Filesystem for FuseFS {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        println!("mknod: {}", name.to_str().unwrap());
+
         if let Some(parent_dir) = self.blut.find_with_inode(parent) {
             if let Ok(mut parent_dir) = parent_dir.lock() {
                 let provider = self.providers.get_provider(parent_dir.provider_id.as_ref().clone()).unwrap();
@@ -425,6 +478,7 @@ impl Filesystem for FuseFS {
     
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
         println!("read: {}", ino);
+
         if let Some(file) = self.blut.find_with_inode(ino) {
             if let Ok(file) = file.lock() {
                 let provider = self.providers.get_provider(file.provider_id.as_ref().clone()).unwrap();
@@ -434,6 +488,48 @@ impl Filesystem for FuseFS {
                     let data = provider.as_filesystem().unwrap().read_file(file.id.clone()).await.unwrap();
                     println!("--- read {} offset: {offset}, size: {size} ---", file.id.as_str());
                     reply.data(&data[offset as usize..std::cmp::min(offset as usize + size as usize, data.len())]);
+                });
+            }
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    fn rename(
+            &mut self,
+            _req: &Request<'_>,
+            parent: u64,
+            name: &OsStr,
+            newparent: u64,
+            newname: &OsStr,
+            _flags: u32,
+            reply: fuser::ReplyEmpty,
+        ) {
+        if let Some(node) = self.blut.find_with_name(parent, name.to_str().unwrap()) {
+            if let Ok(mut node) = node.lock() {
+                let provider = self.providers.get_provider(node.provider_id.as_ref().clone()).unwrap();
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    
+                rt.block_on(async {
+                    let mut object_id = node.id.clone();
+                    if name != newname {
+                        object_id = provider.as_filesystem().unwrap().rename(node.id.clone(), newname.to_str().unwrap().to_string()).await.unwrap();
+                        node.name = newname.to_str().unwrap().to_string();
+                        self.blut.rename(parent, name.to_str().unwrap(), newname.to_str().unwrap());
+                    }
+
+                    if parent != newparent {
+                        let new_parent = self.blut.find_with_inode(newparent).unwrap();
+                        let new_parent = new_parent.lock().unwrap();
+                        object_id = provider.as_filesystem().unwrap().move_to(object_id.clone(), new_parent.id.clone()).await.unwrap();
+                    }
+
+                    node.children = Vec::new();
+                    node.content_state = FileState::ShallowReady;
+
+                    node.id = object_id;
+
+                    reply.ok();
                 });
             }
         } else {
@@ -458,7 +554,7 @@ impl Filesystem for FuseFS {
             reply: fuser::ReplyWrite,
         ) {
         if let Some(file) = self.blut.find_with_inode(ino) {
-            if let Ok(file) = file.lock() {
+            if let Ok(mut file) = file.lock() {
                 let provider = self.providers.get_provider(file.provider_id.as_ref().clone()).unwrap();
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     
@@ -471,6 +567,7 @@ impl Filesystem for FuseFS {
                         content = data.to_vec();
                     }
                     provider.as_filesystem().unwrap().write_file(file.id.clone(), content.into()).await.unwrap();
+                    file.size = data.len() as u64;
                     reply.written(data.len() as u32);
                 });
             }
