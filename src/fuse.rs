@@ -16,7 +16,7 @@ use crossroads::storage::{ProvidersMap, ProviderId};
 use serde_json::Value;
 use crossroads::storage::ProviderType;
 
-use crate::blut::{FsTree, FsNode, FileState};
+use crate::fstree::{FsTree, FsNode, FileState};
 
 pub struct FuseFS {
     providers: ProvidersMap,

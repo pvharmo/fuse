@@ -36,7 +36,6 @@ pub struct FsNode {
     pub children: Vec<Arc<Mutex<FsNode>>>,
 }
 
-// Bidirectionnal lookup table
 pub struct FsTree {
     inodes: HashMap<u64, Weak<Mutex<FsNode>>>,
     names: HashMap<(u64, String), Weak<Mutex<FsNode>>>,

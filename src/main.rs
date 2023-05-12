@@ -2,7 +2,7 @@ use crossroads::storage::*;
 
 mod fuse;
 mod mount;
-mod blut;
+mod fstree;
 
 fn main() {
     let options = ProvidersOptions {
