@@ -8,9 +8,10 @@ use libc::ENOENT;
 use crossroads::providers::google_drive::Token;
 use crossroads::providers::onedrive::token::OneDriveToken;
 use std::fs;
+use chrono;
 
 use fuser::{FileType, FileAttr, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
-use crossroads::interfaces::filesystem::{ObjectId, FileSystem, File};
+use crossroads::interfaces::filesystem::{ObjectId, FileSystem, File, Metadata};
 use crossroads::providers::native_fs::NativeFs;
 use crossroads::storage::{ProvidersMap, ProviderId};
 use serde_json::Value;
@@ -20,7 +21,7 @@ use crate::fstree::{FsTree, FsNode, FileState};
 
 pub struct FuseFS {
     providers: ProvidersMap,
-    blut: FsTree,
+    tree: FsTree,
 }
 
 const TTL: Duration = Duration::from_secs(1);
@@ -53,7 +54,7 @@ impl FuseFS {
             if !std::path::Path::new(data_dir.as_str()).exists() {
                 fs::create_dir_all(data_dir.clone()).expect(format!("Unable to create directory {}", data_dir).as_str());
             }
-            let files = storage.list_folder_content(ObjectId::directory(data_dir.clone())).await.unwrap();
+            let files = storage.read_directory(ObjectId::directory(data_dir.clone())).await.unwrap();
     
             for file in files {
                 let path = x.clone() + "/" + file.name.as_str();
@@ -94,7 +95,7 @@ impl FuseFS {
 
         let providers_list = providers.list_providers();
         
-        FuseFS { providers, blut: FsTree::new(providers_list) }
+        FuseFS { providers, tree: FsTree::new(providers_list) }
     }
 
     fn get_children(&mut self, node: &mut FsNode) -> Vec<Arc<Mutex<FsNode>>> {
@@ -115,17 +116,17 @@ impl FuseFS {
 
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 let res = rt.block_on(async {
-                    fs_provider.as_filesystem().unwrap().list_folder_content(path).await
+                    fs_provider.as_filesystem().unwrap().read_directory(path).await
                 }).unwrap();
 
                 let provider_id = node.provider_id.clone();
 
                 for file in res {
-                    self.blut.new_file(
+                    self.tree.new_file(
                         node,
                         file.id.clone(),
                         file.name.as_str(),
-                        file.size.unwrap_or(0),
+                        if let Some(metadata) = file.metadata { Some(metadata.into()) } else { None },
                         provider_id.clone(),
                     );
                 }
@@ -153,31 +154,9 @@ impl Filesystem for FuseFS {
     fn lookup(&mut self, _req: &Request, parent_inode: u64, name: &OsStr, reply: ReplyEntry) {
         println!("lookup: {parent_inode}, {}", name.to_str().unwrap());
         
-        if let Some(fs_node) = self.blut.find_with_name(parent_inode, name.to_str().unwrap()) {
-            if let Ok(mut node) = fs_node.lock() {
-                let file_type: FileType = if node.id.is_directory() {
-                    FileType::Directory
-                } else {
-                    FileType::RegularFile
-                };
-    
-                reply.entry(&TTL, &FileAttr {
-                    ino: node.inode,
-                    size: node.size,
-                    blocks: 0,
-                    atime: UNIX_EPOCH, // 1970-01-01 00:00:00
-                    mtime: UNIX_EPOCH,
-                    ctime: UNIX_EPOCH,
-                    crtime: UNIX_EPOCH,
-                    kind: file_type,
-                    perm: 0o755,
-                    nlink: self.get_children(&mut node).len() as u32,
-                    uid: 501,
-                    gid: 20,
-                    rdev: 0,
-                    flags: 0,
-                    blksize: 512,
-                }, 0);
+        if let Some(fs_node) = self.tree.find_with_name(parent_inode, name.to_str().unwrap()) {
+            if let Ok(node) = fs_node.lock() {
+                reply.entry(&TTL, &(*node).clone().into(), 0);
             }
         } else {
             reply.error(ENOENT);
@@ -192,36 +171,41 @@ impl Filesystem for FuseFS {
             uid: Option<u32>,
             gid: Option<u32>,
             size: Option<u64>,
-            _atime: Option<fuser::TimeOrNow>,
-            _mtime: Option<fuser::TimeOrNow>,
-            _ctime: Option<std::time::SystemTime>,
+            atime: Option<fuser::TimeOrNow>,
+            mtime: Option<fuser::TimeOrNow>,
+            ctime: Option<std::time::SystemTime>,
             _fh: Option<u64>,
-            _crtime: Option<std::time::SystemTime>,
+            crtime: Option<std::time::SystemTime>,
             _chgtime: Option<std::time::SystemTime>,
             _bkuptime: Option<std::time::SystemTime>,
-            flags: Option<u32>,
+            _flags: Option<u32>,
             reply: ReplyAttr,
         ) {
-        if let Some(fs_node) = self.blut.find_with_inode(ino) {
+        if let Some(fs_node) = self.tree.find_with_inode(ino) {
             if let Ok(node) = fs_node.lock() {
-                reply.attr(&TTL, &FileAttr {
-                    ino: node.inode,
-                    size: size.unwrap_or(node.size),
-                    blocks: node.blocks,
-                    atime: SystemTime::now(),
-                    mtime: SystemTime::now(),
-                    ctime: SystemTime::now(),
-                    crtime: SystemTime::now(),
-                    kind: if node.id.is_directory() {FileType::Directory} else {FileType::RegularFile},
-                    perm: node.perm,
-                    nlink: node.children.len() as u32,
-                    uid: uid.unwrap_or(node.uid),
-                    gid: gid.unwrap_or(node.gid),
-                    rdev: node.rdev,
-                    blksize: node.blksize,
-                    flags: flags.unwrap_or(node.flags), 
-                })
-            }
+                if let Some(mut metadata) = node.metadata {
+                    metadata.size = size.unwrap_or(metadata.size);
+                    metadata.atime = match atime.unwrap_or(fuser::TimeOrNow::Now) {
+                        fuser::TimeOrNow::SpecificTime(time) => time,
+                        fuser::TimeOrNow::Now => SystemTime::now(),
+                    };
+                    metadata.mtime = match mtime.unwrap_or(fuser::TimeOrNow::Now) {
+                        fuser::TimeOrNow::SpecificTime(time) => time,
+                        fuser::TimeOrNow::Now => SystemTime::now(),
+                    };
+                    metadata.ctime = ctime.unwrap_or(metadata.ctime);
+                    metadata.crtime = crtime.unwrap_or(metadata.crtime);
+                    metadata.uid = uid.unwrap_or(metadata.uid);
+                    metadata.gid = gid.unwrap_or(metadata.gid);
+                } else {
+                    reply.error(ENOENT);
+                    return;
+                }
+                reply.attr(&TTL, &(*node).clone().into())
+            } else {
+                reply.error(ENOENT);
+                return;
+            };
         } else {
             reply.error(ENOENT);
         }
@@ -235,31 +219,9 @@ impl Filesystem for FuseFS {
             return;
         }
 
-        if let Some(fs_node) = self.blut.find_with_inode(ino) {
-            if let Ok(mut node) = fs_node.lock() {
-                let file_type = if node.id.is_directory() {
-                    FileType::Directory
-                } else {
-                    FileType::RegularFile
-                };
-    
-                reply.attr(&TTL, &FileAttr {
-                    ino,
-                    size: node.size,
-                    blocks: 0,
-                    atime: UNIX_EPOCH, // 1970-01-01 00:00:00
-                    mtime: UNIX_EPOCH,
-                    ctime: UNIX_EPOCH,
-                    crtime: UNIX_EPOCH,
-                    kind: file_type,
-                    perm: 0o755,
-                    nlink: self.get_children(&mut node).len() as u32,
-                    uid: 501,
-                    gid: 20,
-                    rdev: 0,
-                    flags: 0,
-                    blksize: 512,                    
-                });
+        if let Some(fs_node) = self.tree.find_with_inode(ino) {
+            if let Ok(node) = fs_node.lock() {
+                reply.attr(&TTL, &(*node).clone().into());
             }
         } else {
             reply.error(ENOENT);
@@ -275,7 +237,7 @@ impl Filesystem for FuseFS {
                 let provider = providers.get(offset as usize).unwrap();
                 let provider_name = provider.id.clone();
                 let provider_name = provider_name.as_bytes();
-                let node = self.blut.find_with_ids(ObjectId::root(), (*provider).clone());
+                let node = self.tree.find_with_ids(ObjectId::root(), (*provider).clone());
                 if let Ok(node) = node.unwrap().lock() {
                     let _ = reply.add(node.inode, offset + 1, FileType::Directory, OsStr::from_bytes(provider_name));
                 }
@@ -290,7 +252,7 @@ impl Filesystem for FuseFS {
             _ => {
                 println!("offset: {}", offset);
 
-                if let Some(fs_node) = self.blut.find_with_inode(dir_inode) {
+                if let Some(fs_node) = self.tree.find_with_inode(dir_inode) {
                     let children = self.get_children(&mut fs_node.lock().unwrap());
                     if offset - 2 < children.len().try_into().unwrap() {
                         let child = children.get((offset) as usize - 2).unwrap().as_ref();
@@ -315,7 +277,7 @@ impl Filesystem for FuseFS {
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
         println!("unlink: {}", name.to_str().unwrap());
 
-        if let Some(node) = self.blut.find_with_name(parent, name.to_str().unwrap()) {
+        if let Some(node) = self.tree.find_with_name(parent, name.to_str().unwrap()) {
             if let Ok(node) = node.lock() {
                 let provider = self.providers.get_provider(node.provider_id.as_ref().clone()).unwrap();
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -325,13 +287,13 @@ impl Filesystem for FuseFS {
                 });
             }
 
-            if let Some(parent_node) = self.blut.find_with_inode(parent) {
+            if let Some(parent_node) = self.tree.find_with_inode(parent) {
                 if let Ok(mut parent_node) = parent_node.lock() {
                     parent_node.children.retain(|child| child.lock().unwrap().name != name.to_str().unwrap());
                 }
             }
 
-            self.blut.remove(parent, node);
+            self.tree.remove(parent, node);
         }
 
         reply.ok();
@@ -340,7 +302,7 @@ impl Filesystem for FuseFS {
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
         println!("rmdir: {}", name.to_str().unwrap());
 
-        if let Some(node) = self.blut.find_with_name(parent, name.to_str().unwrap()) {
+        if let Some(node) = self.tree.find_with_name(parent, name.to_str().unwrap()) {
             if let Ok(node) = node.lock() {
                 let provider = self.providers.get_provider(node.provider_id.as_ref().clone()).unwrap();
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -350,13 +312,13 @@ impl Filesystem for FuseFS {
                 });
             }
 
-            if let Some(parent_node) = self.blut.find_with_inode(parent) {
+            if let Some(parent_node) = self.tree.find_with_inode(parent) {
                 if let Ok(mut parent_node) = parent_node.lock() {
                     parent_node.children.retain(|child| child.lock().unwrap().name != name.to_str().unwrap());
                 }
             }
 
-            self.blut.remove(parent, node);
+            self.tree.remove(parent, node);
         }
 
         reply.ok();
@@ -373,7 +335,7 @@ impl Filesystem for FuseFS {
     ) {
         println!("mkdir: {}", name.to_str().unwrap());
 
-        if let Some(parent_dir) = self.blut.find_with_inode(parent) {
+        if let Some(parent_dir) = self.tree.find_with_inode(parent) {
             if let Ok(mut parent_dir) = parent_dir.lock() {
                 let provider = self.providers.get_provider(parent_dir.provider_id.as_ref().clone()).unwrap();
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -383,15 +345,22 @@ impl Filesystem for FuseFS {
                     provider.as_filesystem().unwrap().create(parent_dir.id.clone(), File {
                         id: id.clone(),
                         name: name.to_str().unwrap().to_string(),
-                        mime_type: Some("directory".to_string()),
-                        created_at: None,
-                        modified_at: None,
-                        size: None,
+                        metadata: Some(Metadata {
+                            mime_type: Some("directory".to_string()),
+                            created_at: None,
+                            modified_at: None,
+                            meta_changed_at: None,
+                            accessed_at: None,
+                            size: None,
+                            open_path: None,
+                            owner: None,
+                            permissions: None,
+                        }),
                     }).await.unwrap();
 
                     let provider_id = parent_dir.provider_id.clone();
 
-                    let new_file = self.blut.new_file(&mut parent_dir, id, name.to_str().unwrap(), 0, provider_id);
+                    let new_file = self.tree.new_file(&mut parent_dir, id, name.to_str().unwrap(), None, provider_id);
 
                     dbg!(_mode);
                     dbg!(_umask);
@@ -432,7 +401,7 @@ impl Filesystem for FuseFS {
     ) {
         println!("mknod: {}", name.to_str().unwrap());
 
-        if let Some(parent_dir) = self.blut.find_with_inode(parent) {
+        if let Some(parent_dir) = self.tree.find_with_inode(parent) {
             if let Ok(mut parent_dir) = parent_dir.lock() {
                 let provider = self.providers.get_provider(parent_dir.provider_id.as_ref().clone()).unwrap();
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -442,15 +411,22 @@ impl Filesystem for FuseFS {
                     provider.as_filesystem().unwrap().create(parent_dir.id.clone(), File {
                         id: id.clone(),
                         name: name.to_str().unwrap().to_string(),
-                        mime_type: None,
-                        created_at: None,
-                        modified_at: None,
-                        size: None,
+                        metadata: Some(Metadata {
+                            mime_type: None,
+                            created_at: Some(chrono::Utc::now()),
+                            modified_at: Some(chrono::Utc::now()),
+                            meta_changed_at: Some(chrono::Utc::now()),
+                            accessed_at: None,
+                            size: None,
+                            open_path: None,
+                            owner: None,
+                            permissions: None,
+                        }),
                     }).await.unwrap();
 
                     let provider_id = parent_dir.provider_id.clone();
 
-                    let new_file = self.blut.new_file(&mut parent_dir, id, name.to_str().unwrap(), 0, provider_id);
+                    let new_file = self.tree.new_file(&mut parent_dir, id, name.to_str().unwrap(), None, provider_id);
 
                     reply.entry(&TTL, &FileAttr {
                         ino: new_file.lock().unwrap().inode,
@@ -479,7 +455,7 @@ impl Filesystem for FuseFS {
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
         println!("read: {}", ino);
 
-        if let Some(file) = self.blut.find_with_inode(ino) {
+        if let Some(file) = self.tree.find_with_inode(ino) {
             if let Ok(file) = file.lock() {
                 let provider = self.providers.get_provider(file.provider_id.as_ref().clone()).unwrap();
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -505,7 +481,7 @@ impl Filesystem for FuseFS {
             _flags: u32,
             reply: fuser::ReplyEmpty,
         ) {
-        if let Some(node) = self.blut.find_with_name(parent, name.to_str().unwrap()) {
+        if let Some(node) = self.tree.find_with_name(parent, name.to_str().unwrap()) {
             if let Ok(mut node) = node.lock() {
                 let provider = self.providers.get_provider(node.provider_id.as_ref().clone()).unwrap();
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -515,11 +491,11 @@ impl Filesystem for FuseFS {
                     if name != newname {
                         object_id = provider.as_filesystem().unwrap().rename(node.id.clone(), newname.to_str().unwrap().to_string()).await.unwrap();
                         node.name = newname.to_str().unwrap().to_string();
-                        self.blut.rename(parent, name.to_str().unwrap(), newname.to_str().unwrap());
+                        self.tree.rename(parent, name.to_str().unwrap(), newname.to_str().unwrap());
                     }
 
                     if parent != newparent {
-                        let new_parent = self.blut.find_with_inode(newparent).unwrap();
+                        let new_parent = self.tree.find_with_inode(newparent).unwrap();
                         let new_parent = new_parent.lock().unwrap();
                         object_id = provider.as_filesystem().unwrap().move_to(object_id.clone(), new_parent.id.clone()).await.unwrap();
                     }
@@ -553,7 +529,7 @@ impl Filesystem for FuseFS {
             _lock_owner: Option<u64>,
             reply: fuser::ReplyWrite,
         ) {
-        if let Some(file) = self.blut.find_with_inode(ino) {
+        if let Some(file) = self.tree.find_with_inode(ino) {
             if let Ok(mut file) = file.lock() {
                 let provider = self.providers.get_provider(file.provider_id.as_ref().clone()).unwrap();
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -567,7 +543,8 @@ impl Filesystem for FuseFS {
                         content = data.to_vec();
                     }
                     provider.as_filesystem().unwrap().write_file(file.id.clone(), content.into()).await.unwrap();
-                    file.size = data.len() as u64;
+                    let metadata = file.metadata.as_mut().unwrap();
+                    metadata.size = data.len() as u64;
                     reply.written(data.len() as u32);
                 });
             }

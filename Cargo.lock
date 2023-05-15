@@ -501,6 +501,7 @@ name = "fuse"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "crossroads",
  "derivative",
  "directories",
