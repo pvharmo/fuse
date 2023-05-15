@@ -3,12 +3,11 @@ use std::sync::{Arc, Mutex};
 use std::{ffi::OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, UNIX_EPOCH, SystemTime};
-use crossroads::interfaces::Provider;
 use directories::{ProjectDirs, UserDirs};
 use libc::ENOENT;
 use crossroads::providers::google_drive::Token;
 use crossroads::providers::onedrive::token::OneDriveToken;
-use std::{fs, path};
+use std::fs;
 use chrono;
 
 use fuser::{FileType, FileAttr, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
@@ -99,33 +98,6 @@ impl FuseFS {
         FuseFS { providers, tree: FsTree::new(providers_list) }
     }
 
-    fn load_children(&mut self, node: &mut FsNode, fs_provider: Arc<dyn Provider>, path: ObjectId) {
-        node.content_state = FileState::Loading;
-
-        dbg!(&path);
-
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let res = rt.block_on(async {
-            fs_provider.as_filesystem().unwrap().read_directory(path).await
-        }).unwrap();
-
-        let provider_id = node.provider_id.clone();
-
-        for file in res {
-            self.tree.new_file(
-                node,
-                file.id.clone(),
-                file.name.as_str(),
-                if let Some(metadata) = file.metadata { Some(metadata.into()) } else { None },
-                provider_id.clone(),
-            );
-        }
-
-        node.expire_at = Some(SystemTime::now() + Duration::from_secs(1));
-
-        node.content_state = FileState::DeepReady;
-    }
-
     fn get_children(&mut self, node: &mut FsNode) -> Vec<Arc<Mutex<FsNode>>> {
         let children;
         let path = node.id.clone();
@@ -140,7 +112,30 @@ impl FuseFS {
         
         match node.content_state.clone() {
             FileState::ShallowReady => {
-                self.load_children(node, fs_provider, path);
+                node.content_state = FileState::Loading;
+
+                dbg!(&path);
+
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let res = rt.block_on(async {
+                    fs_provider.as_filesystem().unwrap().read_directory(path).await
+                }).unwrap();
+
+                let provider_id = node.provider_id.clone();
+
+                for file in res {
+                    self.tree.new_file(
+                        node,
+                        file.id.clone(),
+                        file.name.as_str(),
+                        if let Some(metadata) = file.metadata { Some(metadata.into()) } else { None },
+                        provider_id.clone(),
+                    );
+                }
+
+                node.expire_at = Some(SystemTime::now() + Duration::from_secs(1));
+
+                node.content_state = FileState::DeepReady;
 
                 children = node.children.clone();
             },
@@ -153,7 +148,38 @@ impl FuseFS {
             FileState::DeepReady => {
                 if let Some(expire_at) = node.expire_at {
                     if expire_at < SystemTime::now() {
-                        self.load_children(node, fs_provider, path);
+                        node.content_state = FileState::Loading;
+
+                        dbg!(&path);
+
+                        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                        let res = rt.block_on(async {
+                            fs_provider.as_filesystem().unwrap().read_directory(path).await
+                        }).unwrap();
+
+                        let provider_id = node.provider_id.clone();
+
+                        node.children.retain(|child| {
+                            let child = child.lock().unwrap();
+                            res.iter().find(|file| file.id == child.id).is_some()
+                        });
+
+                        for file in res {
+                            if node.children.iter().find(|child| child.lock().unwrap().id == file.id).is_some() {
+                                continue;
+                            }
+                            self.tree.new_file(
+                                node,
+                                file.id.clone(),
+                                file.name.as_str(),
+                                if let Some(metadata) = file.metadata { Some(metadata.into()) } else { None },
+                                provider_id.clone(),
+                            );
+                        }
+
+                        node.expire_at = Some(SystemTime::now() + Duration::from_secs(1));
+
+                        node.content_state = FileState::DeepReady;
                     }
                 }
                 children = node.children.clone();
