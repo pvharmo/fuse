@@ -457,7 +457,7 @@ impl Filesystem for FuseFS {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     
                 rt.block_on(async {
-                    let id = ObjectId::new(parent_dir.id.to_string() + "/" + name.to_str().unwrap(), None);
+                    let id = ObjectId::new(parent_dir.id.to_string() + "/" + name.to_str().unwrap(), crossroads::interfaces::filesystem::FileType::File);
                     provider.as_filesystem().unwrap().create(parent_dir.id.clone(), File {
                         id: id.clone(),
                         name: name.to_str().unwrap().to_string(),
