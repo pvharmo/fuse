@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 use std::{ffi::OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, UNIX_EPOCH, SystemTime};
+use crossroads::interfaces::Provider;
 use directories::{ProjectDirs, UserDirs};
 use libc::ENOENT;
 use crossroads::providers::google_drive::Token;
 use crossroads::providers::onedrive::token::OneDriveToken;
-use std::fs;
+use std::{fs, path};
 use chrono;
 
 use fuser::{FileType, FileAttr, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
@@ -98,6 +99,33 @@ impl FuseFS {
         FuseFS { providers, tree: FsTree::new(providers_list) }
     }
 
+    fn load_children(&mut self, node: &mut FsNode, fs_provider: Arc<dyn Provider>, path: ObjectId) {
+        node.content_state = FileState::Loading;
+
+        dbg!(&path);
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let res = rt.block_on(async {
+            fs_provider.as_filesystem().unwrap().read_directory(path).await
+        }).unwrap();
+
+        let provider_id = node.provider_id.clone();
+
+        for file in res {
+            self.tree.new_file(
+                node,
+                file.id.clone(),
+                file.name.as_str(),
+                if let Some(metadata) = file.metadata { Some(metadata.into()) } else { None },
+                provider_id.clone(),
+            );
+        }
+
+        node.expire_at = Some(SystemTime::now() + Duration::from_secs(1));
+
+        node.content_state = FileState::DeepReady;
+    }
+
     fn get_children(&mut self, node: &mut FsNode) -> Vec<Arc<Mutex<FsNode>>> {
         let children;
         let path = node.id.clone();
@@ -107,31 +135,12 @@ impl FuseFS {
         }
 
         let fs_provider = self.providers.get_provider((*node.provider_id).clone()).unwrap();
+
+        
         
         match node.content_state.clone() {
             FileState::ShallowReady => {
-                node.content_state = FileState::Loading;
-
-                dbg!(&path);
-
-                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-                let res = rt.block_on(async {
-                    fs_provider.as_filesystem().unwrap().read_directory(path).await
-                }).unwrap();
-
-                let provider_id = node.provider_id.clone();
-
-                for file in res {
-                    self.tree.new_file(
-                        node,
-                        file.id.clone(),
-                        file.name.as_str(),
-                        if let Some(metadata) = file.metadata { Some(metadata.into()) } else { None },
-                        provider_id.clone(),
-                    );
-                }
-
-                node.content_state = FileState::DeepReady;
+                self.load_children(node, fs_provider, path);
 
                 children = node.children.clone();
             },
@@ -142,6 +151,11 @@ impl FuseFS {
                 children = node.children.clone();
             },
             FileState::DeepReady => {
+                if let Some(expire_at) = node.expire_at {
+                    if expire_at < SystemTime::now() {
+                        self.load_children(node, fs_provider, path);
+                    }
+                }
                 children = node.children.clone();
             },
         }
@@ -220,7 +234,17 @@ impl Filesystem for FuseFS {
         }
 
         if let Some(fs_node) = self.tree.find_with_inode(ino) {
-            if let Ok(node) = fs_node.lock() {
+            if let Ok(mut node) = fs_node.lock() {
+                let provider = self.providers.get_provider(node.provider_id.as_ref().clone()).unwrap();
+
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    
+                rt.block_on(async {
+                    let metadata = provider.as_filesystem().unwrap().get_metadata(node.id.clone()).await.unwrap();
+
+                    node.metadata = Some(metadata.into());
+                });
+
                 reply.attr(&TTL, &(*node).clone().into());
             }
         } else {
@@ -547,6 +571,40 @@ impl Filesystem for FuseFS {
                     metadata.size = data.len() as u64;
                     reply.written(data.len() as u32);
                 });
+            }
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    fn fsyncdir(
+            &mut self,
+            _req: &Request<'_>,
+            ino: u64,
+            _fh: u64,
+            datasync: bool,
+            reply: fuser::ReplyEmpty,
+        ) {
+        println!("fsyncdir: {}", ino);
+
+        if let Some(dir) = self.tree.find_with_inode(ino) {
+            if let Ok(mut dir) = dir.lock() {
+                dir.children = Vec::new();
+                dir.content_state = FileState::ShallowReady;
+
+                self.get_children(&mut dir);
+
+                if !datasync {
+                    let provider = self.providers.get_provider(dir.provider_id.as_ref().clone()).unwrap();
+    
+                    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        
+                    rt.block_on(async {
+                        let metadata = provider.as_filesystem().unwrap().get_metadata(dir.id.clone()).await.unwrap();
+    
+                        dir.metadata = Some(metadata.into());
+                    });
+                }
             }
         } else {
             reply.error(ENOENT);

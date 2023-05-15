@@ -1,8 +1,8 @@
 
-use std::{collections::HashMap, sync::{Arc, Mutex, Weak}, time::SystemTime};
+use std::{collections::HashMap, sync::{Arc, Mutex, Weak}, time::{SystemTime, Duration}};
 
 use derivative::Derivative;
-use crossroads::{storage::ProviderId, interfaces::filesystem::{ObjectId, Permissions, UserId, User}};
+use crossroads::{storage::ProviderId, interfaces::filesystem::{ObjectId, Permissions, UserId}};
 use fuser::FileAttr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -19,6 +19,7 @@ pub struct FsNode {
     pub inode: u64,
     pub name: String,
     pub metadata: Option<Metadata>,
+    pub expire_at: Option<SystemTime>,
     pub provider_id: Arc<ProviderId>,
     #[derivative(PartialEq="ignore")]
     pub content_state: FileState,
@@ -122,13 +123,12 @@ impl From<crossroads::interfaces::filesystem::Metadata> for Metadata {
 
 impl FsTree {
     pub fn new(providers: Vec<ProviderId>) -> FsTree {
-        
-
         let root = FsNode {
             id: ObjectId::root(),
             name: "/".to_string(),
             provider_id: Arc::new(ProviderId {id: "".to_string(), provider_type: crossroads::storage::ProviderType::NativeFs}),
             inode: 1,
+            expire_at: None,
             metadata: None,
             content_state: FileState::ShallowReady,
             children: Vec::new()
@@ -163,6 +163,7 @@ impl FsTree {
             name: name.to_string(),
             provider_id: provider_id.clone(),
             inode,
+            expire_at: None,
             metadata: Some(Metadata {
                 size,
                 blocks: 0,
@@ -199,6 +200,7 @@ impl FsTree {
             name: name.to_string(),
             provider_id: provider_id.clone(),
             inode,
+            expire_at: Some(SystemTime::now() + Duration::from_secs(1)),
             metadata: metadata,
             content_state: FileState::ShallowReady,
             children: Vec::new()
