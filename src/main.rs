@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use crossroads::storage::*;
 
 mod fuse;
@@ -12,6 +14,8 @@ fn main() {
 
     let mut fs = None;
 
+    let mount_point = Path::new("../tmp/fuse/mnt");
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -19,10 +23,10 @@ fn main() {
         .block_on(async {
             let providers: ProvidersMap = ProvidersMap::new(options).await;
         
-            fs = Some(fuse::FuseFS::new(providers).await);
+            fs = Some(fuse::FuseFS::new(providers, &mount_point).await);
         });
 
-    let mountpoint = mount::Mount::new("../tmp/fuse/mnt");
+    let mountpoint = mount::Mount::new(&mount_point);
 
     mountpoint.mount(fs.unwrap()).unwrap();
 }

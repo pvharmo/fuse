@@ -1,27 +1,32 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::{ffi::OsStr};
-use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, UNIX_EPOCH, SystemTime};
 use directories::{ProjectDirs, UserDirs};
-use libc::ENOENT;
 use crossroads::providers::google_drive::Token;
 use crossroads::providers::onedrive::token::OneDriveToken;
 use std::fs;
-use chrono;
 
-use fuser::{FileType, FileAttr, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
-use crossroads::interfaces::filesystem::{ObjectId, FileSystem, File, Metadata};
+use fuser::{FileType, FileAttr, Filesystem, ReplyAttr, ReplyEntry, Request};
+use crossroads::interfaces::filesystem::{ObjectId, FileSystem};
 use crossroads::providers::native_fs::NativeFs;
 use crossroads::storage::{ProvidersMap, ProviderId};
 use serde_json::Value;
 use crossroads::storage::ProviderType;
 
+use std::ffi::OsStr;
+
 use crate::fstree::{FsTree, FsNode, FileState};
+
+mod attr;
+mod node;
+mod dir;
+mod symlink;
 
 pub struct FuseFS {
     providers: ProvidersMap,
     tree: FsTree,
+    mount_point: PathBuf,
 }
 
 const TTL: Duration = Duration::from_secs(1);
@@ -45,7 +50,7 @@ const ROOT_DIR_ATTR: FileAttr = FileAttr {
 };
 
 impl FuseFS {
-    pub async fn new(mut providers: ProvidersMap) -> Self {
+    pub async fn new(mut providers: ProvidersMap, mount_point: &Path) -> Self {
         let storage = NativeFs { root : "".to_string() };
 
         if let Some(proj_dirs) = ProjectDirs::from("", "Orbital", "Files") {
@@ -95,10 +100,22 @@ impl FuseFS {
 
         let providers_list = providers.list_providers();
         
-        FuseFS { providers, tree: FsTree::new(providers_list) }
+        FuseFS { providers, tree: FsTree::new(providers_list), mount_point: fs::canonicalize(mount_point).unwrap().to_path_buf() }
     }
 
     fn get_children(&mut self, node: &mut FsNode) -> Vec<Arc<Mutex<FsNode>>> {
+        if node.content_state == FileState::DeepReady {
+            if let Some(expire_at) = node.expire_at {
+                if expire_at > SystemTime::now() {
+                    return node.children.clone();
+                }
+            }
+        }
+
+        return self.fetch_children(node);
+    }
+
+    fn fetch_children(&mut self, node: &mut FsNode) -> Vec<Arc<Mutex<FsNode>>> {
         let children;
         let path = node.id.clone();
 
@@ -114,8 +131,6 @@ impl FuseFS {
             FileState::ShallowReady => {
                 node.content_state = FileState::Loading;
 
-                dbg!(&path);
-
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 let res = rt.block_on(async {
                     fs_provider.as_filesystem().unwrap().read_directory(path).await
@@ -124,6 +139,7 @@ impl FuseFS {
                 let provider_id = node.provider_id.clone();
 
                 for file in res {
+                    println!("{}", file.name.as_str());
                     self.tree.new_file(
                         node,
                         file.id.clone(),
@@ -146,42 +162,36 @@ impl FuseFS {
                 children = node.children.clone();
             },
             FileState::DeepReady => {
-                if let Some(expire_at) = node.expire_at {
-                    if expire_at < SystemTime::now() {
-                        node.content_state = FileState::Loading;
+                node.content_state = FileState::Loading;
 
-                        dbg!(&path);
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let res = rt.block_on(async {
+                    fs_provider.as_filesystem().unwrap().read_directory(path).await
+                }).unwrap();
 
-                        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-                        let res = rt.block_on(async {
-                            fs_provider.as_filesystem().unwrap().read_directory(path).await
-                        }).unwrap();
+                let provider_id = node.provider_id.clone();
 
-                        let provider_id = node.provider_id.clone();
+                node.children.retain(|child| {
+                    let child = child.lock().unwrap();
+                    res.iter().find(|file| file.id == child.id).is_some()
+                });
 
-                        node.children.retain(|child| {
-                            let child = child.lock().unwrap();
-                            res.iter().find(|file| file.id == child.id).is_some()
-                        });
-
-                        for file in res {
-                            if node.children.iter().find(|child| child.lock().unwrap().id == file.id).is_some() {
-                                continue;
-                            }
-                            self.tree.new_file(
-                                node,
-                                file.id.clone(),
-                                file.name.as_str(),
-                                if let Some(metadata) = file.metadata { Some(metadata.into()) } else { None },
-                                provider_id.clone(),
-                            );
-                        }
-
-                        node.expire_at = Some(SystemTime::now() + Duration::from_secs(1));
-
-                        node.content_state = FileState::DeepReady;
+                for file in res {
+                    if node.children.iter().find(|child| child.lock().unwrap().id == file.id).is_some() {
+                        continue;
                     }
+                    self.tree.new_file(
+                        node,
+                        file.id.clone(),
+                        file.name.as_str(),
+                        if let Some(metadata) = file.metadata { Some(metadata.into()) } else { None },
+                        provider_id.clone(),
+                    );
                 }
+
+                node.expire_at = Some(SystemTime::now() + Duration::from_secs(1));
+
+                node.content_state = FileState::DeepReady;
                 children = node.children.clone();
             },
         }
@@ -191,449 +201,137 @@ impl FuseFS {
 }
 
 impl Filesystem for FuseFS {
-    fn lookup(&mut self, _req: &Request, parent_inode: u64, name: &OsStr, reply: ReplyEntry) {
-        println!("lookup: {parent_inode}, {}", name.to_str().unwrap());
-        
-        if let Some(fs_node) = self.tree.find_with_name(parent_inode, name.to_str().unwrap()) {
-            if let Ok(node) = fs_node.lock() {
-                reply.entry(&TTL, &(*node).clone().into(), 0);
-            }
-        } else {
-            reply.error(ENOENT);
-        }
+    fn lookup(&mut self, req: &Request, parent_inode: u64, name: &OsStr, reply: ReplyEntry) {
+        self.internal_lookup(req, parent_inode, name, reply)
+    }
+
+    fn getattr(&mut self, req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+        self.internal_getattr(req, ino, reply)
     }
 
     fn setattr(
             &mut self,
-            _req: &Request<'_>,
+            req: &Request<'_>,
             ino: u64,
-            _mode: Option<u32>,
+            mode: Option<u32>,
             uid: Option<u32>,
             gid: Option<u32>,
             size: Option<u64>,
             atime: Option<fuser::TimeOrNow>,
             mtime: Option<fuser::TimeOrNow>,
-            ctime: Option<std::time::SystemTime>,
-            _fh: Option<u64>,
-            crtime: Option<std::time::SystemTime>,
-            _chgtime: Option<std::time::SystemTime>,
-            _bkuptime: Option<std::time::SystemTime>,
-            _flags: Option<u32>,
+            ctime: Option<SystemTime>,
+            fh: Option<u64>,
+            crtime: Option<SystemTime>,
+            chgtime: Option<SystemTime>,
+            bkuptime: Option<SystemTime>,
+            flags: Option<u32>,
             reply: ReplyAttr,
         ) {
-        if let Some(fs_node) = self.tree.find_with_inode(ino) {
-            if let Ok(node) = fs_node.lock() {
-                if let Some(mut metadata) = node.metadata {
-                    metadata.size = size.unwrap_or(metadata.size);
-                    metadata.atime = match atime.unwrap_or(fuser::TimeOrNow::Now) {
-                        fuser::TimeOrNow::SpecificTime(time) => time,
-                        fuser::TimeOrNow::Now => SystemTime::now(),
-                    };
-                    metadata.mtime = match mtime.unwrap_or(fuser::TimeOrNow::Now) {
-                        fuser::TimeOrNow::SpecificTime(time) => time,
-                        fuser::TimeOrNow::Now => SystemTime::now(),
-                    };
-                    metadata.ctime = ctime.unwrap_or(metadata.ctime);
-                    metadata.crtime = crtime.unwrap_or(metadata.crtime);
-                    metadata.uid = uid.unwrap_or(metadata.uid);
-                    metadata.gid = gid.unwrap_or(metadata.gid);
-                } else {
-                    reply.error(ENOENT);
-                    return;
-                }
-                reply.attr(&TTL, &(*node).clone().into())
-            } else {
-                reply.error(ENOENT);
-                return;
-            };
-        } else {
-            reply.error(ENOENT);
-        }
-    }
-
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        println!("getattr: {}", ino);
-
-        if ino == 1 {
-            reply.attr(&TTL, &ROOT_DIR_ATTR);
-            return;
-        }
-
-        if let Some(fs_node) = self.tree.find_with_inode(ino) {
-            if let Ok(mut node) = fs_node.lock() {
-                let provider = self.providers.get_provider(node.provider_id.as_ref().clone()).unwrap();
-
-                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    
-                rt.block_on(async {
-                    let metadata = provider.as_filesystem().unwrap().get_metadata(node.id.clone()).await.unwrap();
-
-                    node.metadata = Some(metadata.into());
-                });
-
-                reply.attr(&TTL, &(*node).clone().into());
-            }
-        } else {
-            reply.error(ENOENT);
-        }
-    }
-
-    fn readdir(&mut self, _req: &Request, dir_inode: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        println!("readdir: {}", dir_inode);
-
-        if dir_inode == 1 {
-            let providers = self.providers.list_providers();
-            if offset < providers.len().try_into().unwrap() {
-                let provider = providers.get(offset as usize).unwrap();
-                let provider_name = provider.id.clone();
-                let provider_name = provider_name.as_bytes();
-                let node = self.tree.find_with_ids(ObjectId::root(), (*provider).clone());
-                if let Ok(node) = node.unwrap().lock() {
-                    let _ = reply.add(node.inode, offset + 1, FileType::Directory, OsStr::from_bytes(provider_name));
-                }
-            }
-            reply.ok();
-            return;
-        }
-
-        match offset {
-            0 => {let _ = reply.add(1, 1, FileType::Directory, OsStr::from_bytes(b"."));},
-            1 => {let _ = reply.add(1, 2, FileType::Directory, OsStr::from_bytes(b".."));},
-            _ => {
-                println!("offset: {}", offset);
-
-                if let Some(fs_node) = self.tree.find_with_inode(dir_inode) {
-                    let children = self.get_children(&mut fs_node.lock().unwrap());
-                    if offset - 2 < children.len().try_into().unwrap() {
-                        let child = children.get((offset) as usize - 2).unwrap().as_ref();
-                        if let Ok(child) = child.lock() {
-                            let file_name = child.name.clone();
-                            let file_name = file_name.as_bytes();
-                            let file_type = if child.id.is_directory() {
-                                FileType::Directory
-                            } else {
-                                FileType::RegularFile
-                            };
-                            let _ = reply.add(child.inode, offset + 1, file_type, OsStr::from_bytes(file_name));
-                        }
-                    }
-                }
-            }
-        }
-
-        reply.ok();
-    }
-
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
-        println!("unlink: {}", name.to_str().unwrap());
-
-        if let Some(node) = self.tree.find_with_name(parent, name.to_str().unwrap()) {
-            if let Ok(node) = node.lock() {
-                let provider = self.providers.get_provider(node.provider_id.as_ref().clone()).unwrap();
-                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    
-                rt.block_on(async {
-                    provider.as_filesystem().unwrap().delete(node.id.clone()).await.unwrap();
-                });
-            }
-
-            if let Some(parent_node) = self.tree.find_with_inode(parent) {
-                if let Ok(mut parent_node) = parent_node.lock() {
-                    parent_node.children.retain(|child| child.lock().unwrap().name != name.to_str().unwrap());
-                }
-            }
-
-            self.tree.remove(parent, node);
-        }
-
-        reply.ok();
-    }
-
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
-        println!("rmdir: {}", name.to_str().unwrap());
-
-        if let Some(node) = self.tree.find_with_name(parent, name.to_str().unwrap()) {
-            if let Ok(node) = node.lock() {
-                let provider = self.providers.get_provider(node.provider_id.as_ref().clone()).unwrap();
-                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    
-                rt.block_on(async {
-                    provider.as_filesystem().unwrap().delete(node.id.clone()).await.unwrap();
-                });
-            }
-
-            if let Some(parent_node) = self.tree.find_with_inode(parent) {
-                if let Ok(mut parent_node) = parent_node.lock() {
-                    parent_node.children.retain(|child| child.lock().unwrap().name != name.to_str().unwrap());
-                }
-            }
-
-            self.tree.remove(parent, node);
-        }
-
-        reply.ok();
-    }
-
-    fn mkdir(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        reply: ReplyEntry,
-    ) {
-        println!("mkdir: {}", name.to_str().unwrap());
-
-        if let Some(parent_dir) = self.tree.find_with_inode(parent) {
-            if let Ok(mut parent_dir) = parent_dir.lock() {
-                let provider = self.providers.get_provider(parent_dir.provider_id.as_ref().clone()).unwrap();
-                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    
-                rt.block_on(async {
-                    let id = ObjectId::directory(parent_dir.id.to_string() + "/" + name.to_str().unwrap());
-                    provider.as_filesystem().unwrap().create(parent_dir.id.clone(), File {
-                        id: id.clone(),
-                        name: name.to_str().unwrap().to_string(),
-                        metadata: Some(Metadata {
-                            mime_type: Some("directory".to_string()),
-                            created_at: None,
-                            modified_at: None,
-                            meta_changed_at: None,
-                            accessed_at: None,
-                            size: None,
-                            open_path: None,
-                            owner: None,
-                            permissions: None,
-                        }),
-                    }).await.unwrap();
-
-                    let provider_id = parent_dir.provider_id.clone();
-
-                    let new_file = self.tree.new_file(&mut parent_dir, id, name.to_str().unwrap(), None, provider_id);
-
-                    dbg!(_mode);
-                    dbg!(_umask);
-
-                    reply.entry(&TTL, &FileAttr {
-                        ino: new_file.lock().unwrap().inode,
-                        size: 0,
-                        blocks: 0,
-                        atime: SystemTime::now(), // 1970-01-01 00:00:00
-                        mtime: SystemTime::now(),
-                        ctime: SystemTime::now(),
-                        crtime: SystemTime::now(),
-                        kind: FileType::Directory,
-                        perm: 0o755,
-                        nlink: 0,
-                        uid: 501,
-                        gid: 20,
-                        rdev: 0,
-                        flags: 0,
-                        blksize: 512,                    
-                    }, 0);
-                });
-            }
-        } else {
-            reply.error(ENOENT);
-        }
+        self.internal_setattr(req, ino, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime, bkuptime, flags, reply)
     }
 
     fn mknod(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        _rdev: u32,
-        reply: ReplyEntry,
-    ) {
-        println!("mknod: {}", name.to_str().unwrap());
-
-        if let Some(parent_dir) = self.tree.find_with_inode(parent) {
-            if let Ok(mut parent_dir) = parent_dir.lock() {
-                let provider = self.providers.get_provider(parent_dir.provider_id.as_ref().clone()).unwrap();
-                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    
-                rt.block_on(async {
-                    let id = ObjectId::new(parent_dir.id.to_string() + "/" + name.to_str().unwrap(), crossroads::interfaces::filesystem::FileType::File);
-                    provider.as_filesystem().unwrap().create(parent_dir.id.clone(), File {
-                        id: id.clone(),
-                        name: name.to_str().unwrap().to_string(),
-                        metadata: Some(Metadata {
-                            mime_type: None,
-                            created_at: Some(chrono::Utc::now()),
-                            modified_at: Some(chrono::Utc::now()),
-                            meta_changed_at: Some(chrono::Utc::now()),
-                            accessed_at: None,
-                            size: None,
-                            open_path: None,
-                            owner: None,
-                            permissions: None,
-                        }),
-                    }).await.unwrap();
-
-                    let provider_id = parent_dir.provider_id.clone();
-
-                    let new_file = self.tree.new_file(&mut parent_dir, id, name.to_str().unwrap(), None, provider_id);
-
-                    reply.entry(&TTL, &FileAttr {
-                        ino: new_file.lock().unwrap().inode,
-                        size: 0,
-                        blocks: 0,
-                        atime: SystemTime::now(), // 1970-01-01 00:00:00
-                        mtime: SystemTime::now(),
-                        ctime: SystemTime::now(),
-                        crtime: SystemTime::now(),
-                        kind: FileType::RegularFile,
-                        perm: 0o755,
-                        nlink: 0,
-                        uid: 501,
-                        gid: 20,
-                        rdev: 0,
-                        flags: 0,
-                        blksize: 512,                    
-                    }, 0);
-                });
-            }
-        } else {
-            reply.error(ENOENT);
-        }
+            &mut self,
+            req: &Request<'_>,
+            parent: u64,
+            name: &OsStr,
+            mode: u32,
+            umask: u32,
+            rdev: u32,
+            reply: ReplyEntry,
+        ) {
+        self.internal_mknod(req, parent, name, mode, umask, rdev, reply)
     }
-    
-    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
-        println!("read: {}", ino);
 
-        if let Some(file) = self.tree.find_with_inode(ino) {
-            if let Ok(file) = file.lock() {
-                let provider = self.providers.get_provider(file.provider_id.as_ref().clone()).unwrap();
-                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    
-                rt.block_on(async {
-                    let data = provider.as_filesystem().unwrap().read_file(file.id.clone()).await.unwrap();
-                    println!("--- read {} offset: {offset}, size: {size} ---", file.id.as_str());
-                    reply.data(&data[offset as usize..std::cmp::min(offset as usize + size as usize, data.len())]);
-                });
-            }
-        } else {
-            reply.error(ENOENT);
-        }
+    fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
+        self.internal_unlink(req, parent, name, reply)
+    }
+
+    fn read(
+            &mut self,
+            req: &Request<'_>,
+            ino: u64,
+            fh: u64,
+            offset: i64,
+            size: u32,
+            flags: i32,
+            lock_owner: Option<u64>,
+            reply: fuser::ReplyData,
+        ) {
+        self.internal_read(req, ino, fh, offset, size, flags, lock_owner, reply)
     }
 
     fn rename(
             &mut self,
-            _req: &Request<'_>,
+            req: &Request<'_>,
             parent: u64,
             name: &OsStr,
             newparent: u64,
             newname: &OsStr,
-            _flags: u32,
+            flags: u32,
             reply: fuser::ReplyEmpty,
         ) {
-        if let Some(node) = self.tree.find_with_name(parent, name.to_str().unwrap()) {
-            if let Ok(mut node) = node.lock() {
-                let provider = self.providers.get_provider(node.provider_id.as_ref().clone()).unwrap();
-                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    
-                rt.block_on(async {
-                    let mut object_id = node.id.clone();
-                    if name != newname {
-                        object_id = provider.as_filesystem().unwrap().rename(node.id.clone(), newname.to_str().unwrap().to_string()).await.unwrap();
-                        node.name = newname.to_str().unwrap().to_string();
-                        self.tree.rename(parent, name.to_str().unwrap(), newname.to_str().unwrap());
-                    }
-
-                    if parent != newparent {
-                        let new_parent = self.tree.find_with_inode(newparent).unwrap();
-                        let new_parent = new_parent.lock().unwrap();
-                        object_id = provider.as_filesystem().unwrap().move_to(object_id.clone(), new_parent.id.clone()).await.unwrap();
-                    }
-
-                    node.children = Vec::new();
-                    node.content_state = FileState::ShallowReady;
-
-                    node.id = object_id;
-
-                    reply.ok();
-                });
-            }
-        } else {
-            reply.error(ENOENT);
-        }
+        self.internal_rename(req, parent, name, newparent, newname, flags, reply)
     }
 
-    fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        reply.opened(0, 0)
+    fn open(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
+        self.internal_open(req, ino, flags, reply)
     }
 
     fn write(
             &mut self,
-            _req: &Request<'_>,
+            req: &Request<'_>,
             ino: u64,
-            _fh: u64,
+            fh: u64,
             offset: i64,
             data: &[u8],
-            _write_flags: u32,
-            _flags: i32,
-            _lock_owner: Option<u64>,
+            write_flags: u32,
+            flags: i32,
+            lock_owner: Option<u64>,
             reply: fuser::ReplyWrite,
         ) {
-        if let Some(file) = self.tree.find_with_inode(ino) {
-            if let Ok(mut file) = file.lock() {
-                let provider = self.providers.get_provider(file.provider_id.as_ref().clone()).unwrap();
-                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    
-                rt.block_on(async {
-                    let file_content = provider.as_filesystem().unwrap().read_file(file.id.clone()).await.unwrap();
-                    let content;
-                    if offset > 0 {
-                        content = [&file_content[0..offset as usize], data].concat();
-                    } else {
-                        content = data.to_vec();
-                    }
-                    provider.as_filesystem().unwrap().write_file(file.id.clone(), content.into()).await.unwrap();
-                    let metadata = file.metadata.as_mut().unwrap();
-                    metadata.size = data.len() as u64;
-                    reply.written(data.len() as u32);
-                });
-            }
-        } else {
-            reply.error(ENOENT);
-        }
+        self.internal_write(req, ino, fh, offset, data, write_flags, flags, lock_owner, reply)
     }
 
-    fn fsyncdir(
+    fn mkdir(
             &mut self,
-            _req: &Request<'_>,
-            ino: u64,
-            _fh: u64,
-            datasync: bool,
-            reply: fuser::ReplyEmpty,
+            req: &Request<'_>,
+            parent: u64,
+            name: &OsStr,
+            mode: u32,
+            umask: u32,
+            reply: ReplyEntry,
         ) {
-        println!("fsyncdir: {}", ino);
+        self.internal_mkdir(req, parent, name, mode, umask, reply)
+    }
 
-        if let Some(dir) = self.tree.find_with_inode(ino) {
-            if let Ok(mut dir) = dir.lock() {
-                dir.children = Vec::new();
-                dir.content_state = FileState::ShallowReady;
+    fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
+        self.internal_rmdir(req, parent, name, reply)
+    }
 
-                self.get_children(&mut dir);
+    fn readdir(
+            &mut self,
+            req: &Request<'_>,
+            ino: u64,
+            fh: u64,
+            offset: i64,
+            reply: fuser::ReplyDirectory,
+        ) {
+        self.internal_readdir(req, ino, fh, offset, reply)
+    }
 
-                if !datasync {
-                    let provider = self.providers.get_provider(dir.provider_id.as_ref().clone()).unwrap();
-    
-                    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        
-                    rt.block_on(async {
-                        let metadata = provider.as_filesystem().unwrap().get_metadata(dir.id.clone()).await.unwrap();
-    
-                        dir.metadata = Some(metadata.into());
-                    });
-                }
-            }
-        } else {
-            reply.error(ENOENT);
-        }
+    fn symlink(
+            &mut self,
+            req: &Request<'_>,
+            parent: u64,
+            name: &OsStr,
+            link: &Path,
+            reply: ReplyEntry,
+        ) {
+        self.internal_symlink(req, parent, name, link, reply)
+    }
+
+    fn readlink(&mut self, req: &Request<'_>, ino: u64, reply: fuser::ReplyData) {
+        self.internal_readlink(req, ino, reply)
     }
 }
